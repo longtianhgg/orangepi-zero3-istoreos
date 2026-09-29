@@ -1,0 +1,206 @@
+name: Build Orange Pi Zero 3 iStoreOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      verbose:
+        description: "Parallel build failed 后是否使用 make -j1 V=s 重试"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orangepi-zero3-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build firmware
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      TZ: UTC
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Show runner resources
+        run: |
+          echo "=== CPU ==="
+          nproc
+          echo "=== Memory ==="
+          free -h
+          echo "=== Disk ==="
+          df -h
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          df -h
+
+      - name: Add swap
+        run: |
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            flex \
+            bison \
+            g++ \
+            gawk \
+            gcc-multilib \
+            g++-multilib \
+            gettext \
+            git \
+            libncurses-dev \
+            libssl-dev \
+            libelf-dev \
+            python3 \
+            python3-dev \
+            python3-setuptools \
+            rsync \
+            subversion \
+            swig \
+            unzip \
+            zlib1g-dev \
+            file \
+            wget \
+            curl \
+            bc \
+            time \
+            xsltproc \
+            zstd \
+            ccache \
+            libfuse-dev \
+            libglib2.0-dev \
+            libpixman-1-dev \
+            device-tree-compiler
+
+      - name: Cache downloaded source archives
+        uses: actions/cache@v4
+        with:
+          path: dl
+          key: openwrt-dl-${{ runner.os }}-${{ hashFiles('feeds.conf', 'feeds.conf.default') }}
+          restore-keys: |
+            openwrt-dl-${{ runner.os }}-
+
+      - name: Update and install feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Load Orange Pi Zero 3 config
+        run: |
+          cp configs/orangepi-zero3-istoreos.config .config
+          make defconfig
+
+          echo "=== Target ==="
+          grep -E '^CONFIG_TARGET_sunxi|^CONFIG_TARGET_PROFILE' .config || true
+
+          echo "=== RootFS ==="
+          grep -E '^CONFIG_TARGET_ROOTFS|^# CONFIG_TARGET_ROOTFS' .config || true
+
+          echo "=== Important packages ==="
+          grep -E '^CONFIG_PACKAGE_(luci-app-openclash|tailscale|docker|dockerd|docker-compose|luci-app-dockerman|luci-app-partexp|luci-app-netwizard|luci-app-quickstart)=' .config || true
+
+      - name: Verify permanent Orange Pi Zero 3 fixes
+        run: |
+          test -f target/linux/sunxi/patches-6.6/103-orangepi-zero3-yt8531-phy-stability.patch
+          test -f target/linux/sunxi/patches-6.6/104-orangepi-zero3-disable-spi0.patch
+
+          grep -q 'motorcomm,auto-sleep-disabled' \
+            target/linux/sunxi/patches-6.6/103-orangepi-zero3-yt8531-phy-stability.patch
+
+          grep -q 'motorcomm,keep-pll-enabled' \
+            target/linux/sunxi/patches-6.6/103-orangepi-zero3-yt8531-phy-stability.patch
+
+          grep -q 'status = "disabled"' \
+            target/linux/sunxi/patches-6.6/104-orangepi-zero3-disable-spi0.patch
+
+          test -x files/etc/uci-defaults/99-bypass-router
+          test -x files/etc/openclash/core/clash_meta
+
+          echo "=== Mihomo SHA256 ==="
+          sha256sum files/etc/openclash/core/clash_meta
+
+      - name: Download sources
+        run: |
+          make download -j4
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          set +e
+
+          make -j$(nproc)
+          rc=$?
+
+          set -e
+
+          if [ "$rc" -ne 0 ]; then
+            if [ "${{ inputs.verbose }}" = "true" ]; then
+              echo "::warning::Parallel build failed, retry with make -j1 V=s"
+              make -j1 V=s
+            else
+              exit "$rc"
+            fi
+          fi
+
+      - name: Show build output
+        if: always()
+        run: |
+          echo "=== Disk ==="
+          df -h
+
+          echo "=== Firmware output ==="
+          find bin/targets/sunxi/cortexa53 \
+            -maxdepth 2 \
+            -type f \
+            -printf '%p  %k KiB\n' 2>/dev/null | sort || true
+
+      - name: Prepare artifact
+        if: success()
+        run: |
+          mkdir -p artifact
+
+          cp -av bin/targets/sunxi/cortexa53/* artifact/
+
+          rm -rf artifact/packages
+
+          {
+            echo "Repository: ${{ github.repository }}"
+            echo "Branch: ${{ github.ref_name }}"
+            echo "Commit: ${{ github.sha }}"
+            echo "Runner: ubuntu-24.04"
+            echo "Built: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } > artifact/GITHUB_BUILD_INFO.txt
+
+      - name: Upload firmware artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orangepi-zero3-istoreos-${{ github.run_number }}
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0

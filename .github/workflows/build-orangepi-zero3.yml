@@ -1,24 +1,24 @@
-name: Build Orange Pi Zero 3 iStoreOS
+name: Build & Release Orange Pi Zero 3 iStoreOS
 
 on:
   workflow_dispatch:
     inputs:
-      verbose:
-        description: "Parallel build failed 后是否使用 make -j1 V=s 重试"
+      verbose_retry:
+        description: "并行编译失败后使用 make -j1 V=s 重试"
         required: false
         default: true
         type: boolean
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: orangepi-zero3-build-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
-    name: Build firmware
+    name: Build Orange Pi Zero 3 firmware
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -36,8 +36,10 @@ jobs:
         run: |
           echo "=== CPU ==="
           nproc
+
           echo "=== Memory ==="
           free -h
+
           echo "=== Disk ==="
           df -h
 
@@ -48,19 +50,18 @@ jobs:
           sudo rm -rf /usr/share/dotnet || true
           sudo rm -rf /opt/hostedtoolcache/CodeQL || true
           sudo apt-get clean
+
+          echo "=== Disk after cleanup ==="
           df -h
 
-      - name: Add swap
-        run: |
-          sudo fallocate -l 4G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          echo "=== Existing swap ==="
+          swapon --show || true
           free -h
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
+
           sudo apt-get install -y --no-install-recommends \
             build-essential \
             clang \
@@ -109,9 +110,10 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Load Orange Pi Zero 3 config
+      - name: Load Orange Pi Zero 3 build config
         run: |
           cp configs/orangepi-zero3-istoreos.config .config
+
           make defconfig
 
           echo "=== Target ==="
@@ -123,10 +125,12 @@ jobs:
           echo "=== Important packages ==="
           grep -E '^CONFIG_PACKAGE_(luci-app-openclash|tailscale|docker|dockerd|docker-compose|luci-app-dockerman|luci-app-partexp|luci-app-netwizard|luci-app-quickstart)=' .config || true
 
-      - name: Verify permanent Orange Pi Zero 3 fixes
+      - name: Verify Orange Pi Zero 3 permanent fixes
         run: |
-          test -f target/linux/sunxi/patches-6.6/103-orangepi-zero3-yt8531-phy-stability.patch
-          test -f target/linux/sunxi/patches-6.6/104-orangepi-zero3-disable-spi0.patch
+          echo "=== Verify YT8531C patch ==="
+
+          test -f \
+            target/linux/sunxi/patches-6.6/103-orangepi-zero3-yt8531-phy-stability.patch
 
           grep -q 'motorcomm,auto-sleep-disabled' \
             target/linux/sunxi/patches-6.6/103-orangepi-zero3-yt8531-phy-stability.patch
@@ -134,18 +138,54 @@ jobs:
           grep -q 'motorcomm,keep-pll-enabled' \
             target/linux/sunxi/patches-6.6/103-orangepi-zero3-yt8531-phy-stability.patch
 
+          echo "=== Verify SPI0 disabled patch ==="
+
+          test -f \
+            target/linux/sunxi/patches-6.6/104-orangepi-zero3-disable-spi0.patch
+
           grep -q 'status = "disabled"' \
             target/linux/sunxi/patches-6.6/104-orangepi-zero3-disable-spi0.patch
 
+          echo "=== Verify bypass-router defaults ==="
+
           test -x files/etc/uci-defaults/99-bypass-router
+
+          grep -q "network.lan.device='eth0'" \
+            files/etc/uci-defaults/99-bypass-router
+
+          grep -q "network.lan.proto='dhcp'" \
+            files/etc/uci-defaults/99-bypass-router
+
+          echo "=== Verify Mihomo ==="
+
           test -x files/etc/openclash/core/clash_meta
 
-          echo "=== Mihomo SHA256 ==="
           sha256sum files/etc/openclash/core/clash_meta
 
+          echo "Expected:"
+          echo "9e0f11afbf38426b8bd88fdc594678f8161c57eccb4e1b77acb12b493904f1d4"
+
+          echo \
+            "9e0f11afbf38426b8bd88fdc594678f8161c57eccb4e1b77acb12b493904f1d4  files/etc/openclash/core/clash_meta" \
+            | sha256sum -c -
+
       - name: Download sources
+        shell: bash
         run: |
+          set +e
+
           make download -j4
+          rc=$?
+
+          set -e
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::Parallel download failed, retrying serially"
+            make download -j1 V=s
+          fi
+
+          # 删除异常的小下载文件，让 make 后续能够重新获取
+          find dl -type f -size -1024c -print -delete || true
 
       - name: Build firmware
         shell: bash
@@ -158,49 +198,149 @@ jobs:
           set -e
 
           if [ "$rc" -ne 0 ]; then
-            if [ "${{ inputs.verbose }}" = "true" ]; then
-              echo "::warning::Parallel build failed, retry with make -j1 V=s"
+            if [ "${{ inputs.verbose_retry }}" = "true" ]; then
+              echo "::warning::Parallel build failed, retrying with make -j1 V=s"
               make -j1 V=s
             else
               exit "$rc"
             fi
           fi
 
-      - name: Show build output
-        if: always()
+      - name: Verify firmware output
         run: |
-          echo "=== Disk ==="
-          df -h
+          OUT="bin/targets/sunxi/cortexa53"
 
           echo "=== Firmware output ==="
-          find bin/targets/sunxi/cortexa53 \
-            -maxdepth 2 \
+          find "$OUT" \
+            -maxdepth 1 \
             -type f \
-            -printf '%p  %k KiB\n' 2>/dev/null | sort || true
+            -printf '%f  %k KiB\n' \
+            | sort
 
-      - name: Prepare artifact
-        if: success()
+          echo "=== Looking for Orange Pi Zero 3 image ==="
+
+          IMAGE_COUNT="$(
+            find "$OUT" \
+              -maxdepth 1 \
+              -type f \
+              -name '*orangepi-zero3*.img.gz' \
+              | wc -l
+          )"
+
+          echo "Found $IMAGE_COUNT Orange Pi Zero 3 image(s)"
+
+          if [ "$IMAGE_COUNT" -lt 1 ]; then
+            echo "::error::Orange Pi Zero 3 sdcard image was not generated"
+            exit 1
+          fi
+
+      - name: Prepare Release files
+        id: release_info
+        shell: bash
         run: |
-          mkdir -p artifact
+          OUT="bin/targets/sunxi/cortexa53"
 
-          cp -av bin/targets/sunxi/cortexa53/* artifact/
+          mkdir -p release
 
-          rm -rf artifact/packages
+          # 只复制 target 目录顶层的最终固件及构建信息，
+          # 不复制 packages/ 等大目录。
+          find "$OUT" \
+            -maxdepth 1 \
+            -type f \
+            -exec cp -av {} release/ \;
+
+          DATE="$(date -u +'%Y%m%d')"
+          TAG="orangepi-zero3-${DATE}-r${GITHUB_RUN_NUMBER}"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
           {
-            echo "Repository: ${{ github.repository }}"
-            echo "Branch: ${{ github.ref_name }}"
-            echo "Commit: ${{ github.sha }}"
-            echo "Runner: ubuntu-24.04"
-            echo "Built: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          } > artifact/GITHUB_BUILD_INFO.txt
+            echo "Orange Pi Zero 3 iStoreOS cloud build"
+            echo
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Branch: $GITHUB_REF_NAME"
+            echo "Commit: $GITHUB_SHA"
+            echo "Workflow run: $GITHUB_RUN_NUMBER"
+            echo "Build time: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            echo
+            echo "Target: sunxi/cortexa53"
+            echo "Device: Xunlong Orange Pi Zero 3"
+            echo "Kernel: Linux 6.6"
+            echo
+            echo "Included project fixes:"
+            echo "- Three-partition SquashFS + ext4 Overlay image layout"
+            echo "- Motorcomm YT8531C PHY stability patch"
+            echo "- Onboard SPI0 disabled"
+            echo "- Single-port bypass-router defaults"
+            echo "- OpenClash + Mihomo"
+            echo "- Tailscale"
+            echo "- Docker / Dockerman"
+            echo "- PartExp"
+          } > release/GITHUB_BUILD_INFO.txt
 
-      - name: Upload firmware artifact
+          cat > RELEASE_NOTES.md <<EOF
+          ## Orange Pi Zero 3 iStoreOS
+
+          Automated firmware build from branch \`$GITHUB_REF_NAME\`.
+
+          **Commit**
+
+          \`$GITHUB_SHA\`
+
+          **Target**
+
+          - SoC: Allwinner H618
+          - OpenWrt target: \`sunxi/cortexa53\`
+          - Device: Orange Pi Zero 3
+          - RootFS: SquashFS
+          - Writable Overlay: separate ext4 partition
+
+          **Orange Pi Zero 3 fixes included**
+
+          - YT8531C Gigabit Ethernet stability settings
+          - SPI0 disabled to avoid the previously observed sun6i SPI panic path
+          - Three-partition SD-card image
+          - Single-port bypass-router defaults
+          - OpenClash / Mihomo
+          - Tailscale
+          - Docker / Dockerman
+          - PartExp
+
+          This release was built automatically by GitHub Actions.
+          EOF
+
+          echo "=== Release files ==="
+          ls -lh release/
+
+      - name: Create GitHub Release
+        if: github.ref_name == 'orangepi-zero3'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release_info.outputs.tag }}
+        run: |
+          echo "Creating release: $TAG"
+
+          gh release create "$TAG" \
+            release/* \
+            --target "$GITHUB_SHA" \
+            --title "Orange Pi Zero 3 iStoreOS ${TAG}" \
+            --notes-file RELEASE_NOTES.md
+
+      - name: Final summary
         if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: orangepi-zero3-istoreos-${{ github.run_number }}
-          path: artifact/
-          if-no-files-found: error
-          retention-days: 3
-          compression-level: 0
+        env:
+          TAG: ${{ steps.release_info.outputs.tag }}
+        run: |
+          echo "### Orange Pi Zero 3 build completed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release tag: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Commit: \`$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Firmware has been published to GitHub Releases." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show disk usage
+        if: always()
+        run: |
+          echo "=== Final disk usage ==="
+          df -h

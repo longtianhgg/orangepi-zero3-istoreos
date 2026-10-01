@@ -100,10 +100,16 @@ jobs:
       - name: Cache downloaded source archives
         uses: actions/cache@v4
         with:
-          path: dl
-          key: openwrt-dl-${{ runner.os }}-${{ hashFiles('feeds.conf', 'feeds.conf.default') }}
+          path: |
+            dl
+            !dl/go-mod-cache
+          key: openwrt-dl-v2-${{ runner.os }}-${{ hashFiles('feeds.conf', 'feeds.conf.default') }}
           restore-keys: |
-            openwrt-dl-${{ runner.os }}-
+            openwrt-dl-v2-${{ runner.os }}-
+
+      - name: Reset Go module cache
+        run: |
+          rm -rf dl/go-mod-cache
 
       - name: Update and install feeds
         run: |
